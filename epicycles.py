@@ -8,6 +8,23 @@ import argparse
 import sys
 import os
 
+
+def normalize_curve(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    x -= x.mean()
+    y -= y.mean()
+
+    scale = max(np.ptp(x), np.ptp(y)) / 2
+    if scale == 0:
+        raise ValueError("shape has zero size after sampling")
+
+    x /= scale
+    y /= scale
+    return x, y
+
+
 # built-in example shapes defined as parametric curves sampled at n points
 def make_example_shape(name, n=1000):
     t = np.linspace(0, 2 * np.pi, n, endpoint=False)
@@ -15,19 +32,19 @@ def make_example_shape(name, n=1000):
     if name == "heart":
         x = 16 * np.sin(t) ** 3
         y = 13 * np.cos(t) - 5 * np.cos(2*t) - 2 * np.cos(3*t) - np.cos(4*t)
-        return x, -y  # flip so it faces up
+        return normalize_curve(x, -y)  # flip so it faces up
 
     if name == "star":
         # five-pointed star via radius modulation
         r = 1 + 0.5 * np.cos(5 * t)
-        return r * np.cos(t), r * np.sin(t)
+        return normalize_curve(r * np.cos(t), r * np.sin(t))
 
     if name == "lissajous":
-        return np.sin(3 * t + np.pi/4), np.sin(2 * t)
+        return normalize_curve(np.sin(3 * t + np.pi/4), np.sin(2 * t))
 
     if name == "trefoil":
         r = np.cos(3 * t / 2)
-        return r * np.cos(t), r * np.sin(t)
+        return normalize_curve(r * np.cos(t), r * np.sin(t))
 
     raise ValueError(f"unknown example shape: {name}")
 
@@ -61,11 +78,7 @@ def contour_from_image(path, n=1000):
     y = np.interp(t_new, arc, pts[:, 1])
 
     # center and normalize so the shape fits nicely
-    x -= x.mean()
-    y -= y.mean()
-    scale = max(x.ptp(), y.ptp()) / 2
-    x /= scale
-    y /= scale
+    x, y = normalize_curve(x, y)
     y = -y  # flip because image y goes downward
 
     return x, y
@@ -117,8 +130,10 @@ def run(freqs, coeffs, num_terms, show_arms, output, fps=30, duration=8):
     ax.set_aspect("equal")
     ax.axis("off")
 
-    # set limits with a bit of padding around the unit circle scale
-    pad = 1.4
+    # fit both the traced curve and the epicycle arm chain in view.
+    curve_extent = max(np.abs(ghost.real).max(), np.abs(ghost.imag).max())
+    arm_extent = np.abs(coeffs[:num_terms]).sum()
+    pad = max(curve_extent, arm_extent) * 1.1
     ax.set_xlim(-pad, pad)
     ax.set_ylim(-pad, pad)
 
