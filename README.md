@@ -3,7 +3,7 @@
 `epicycles.py` generates Fourier epicycle animations from either:
 
 - a built-in example shape
-- the outer contour extracted from an image
+- a contour extracted from an image, optionally stitched across multiple internal components
 
 The script samples a 2D curve, computes its discrete Fourier transform, and animates the reconstruction using rotating circles ("epicycles"). You can preview the result interactively or save it as a `.gif` or `.mp4`.
 
@@ -51,6 +51,12 @@ Animate an image contour and show the epicycle arms:
 python3 epicycles.py --image path/to/logo.png --arms
 ```
 
+Stitch multiple image contours into one path to capture internal details:
+
+```bash
+python3 epicycles.py --image path/to/logo.png --stitch-contours --arms
+```
+
 Save a GIF:
 
 ```bash
@@ -93,15 +99,13 @@ python3 epicycles.py --example trefoil
 Load an image and extract a contour from it. The script:
 
 1. reads the image with OpenCV
-2. converts it to grayscale
-3. applies a small Gaussian blur
-4. runs Canny edge detection
-5. finds external contours
-6. keeps the longest contour
-7. resamples that contour to the requested number of points
-8. centers and normalizes it before animation
+2. extracts a binary mask from transparency or image intensity
+3. finds the main outer contour by default
+4. optionally collects multiple disconnected internal components with `--stitch-contours`
+5. resamples the resulting path to the requested number of points
+6. centers and normalizes it before animation
 
-For best results, use a simple high-contrast image with a clear single outline.
+For best results, use a simple high-contrast image with clear dark linework or a transparent background.
 
 Example:
 
@@ -117,6 +121,7 @@ python3 epicycles.py --image assets/shape.png
 | `--example NAME` | choice | none | Built-in example shape: `heart`, `star`, `lissajous`, or `trefoil`. Mutually exclusive with `--image`. |
 | `--terms N` | integer | `50` | Number of Fourier terms / epicycles used for reconstruction. Larger values usually improve detail but add visual complexity. |
 | `--points N` | integer | `1000` | Number of sample points used to represent the source curve before taking the DFT. Higher values preserve more detail but increase computation time. |
+| `--stitch-contours` | flag | off | For image input, stitch multiple detected contour components into one continuous path so internal details are included. This adds bridge segments between components. |
 | `--arms` | flag | off | Draw the spinning arm segments and circles. If omitted, only the traced path and faint target outline are shown. |
 | `--output VALUE` | string | `show` | Output mode. Use `show` for an interactive window, a filename ending in `.gif` for GIF export, or any other filename for MP4 export. |
 | `--fps N` | integer | `30` | Frames per second for the animation. Applies to both display timing and saved output. |
@@ -181,6 +186,12 @@ Increase contour resolution for an image input:
 
 ```bash
 python3 epicycles.py --image path/to/input.png --points 2000
+```
+
+Capture inner details by stitching multiple image components into one path:
+
+```bash
+python3 epicycles.py --image path/to/input.png --stitch-contours --points 2000
 ```
 
 Show the epicycle arms and save a GIF:

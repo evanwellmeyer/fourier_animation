@@ -40,28 +40,63 @@ def contour_score(contour, width, height):
     return score
 
 
-def select_primary_contour(mask):
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+def contour_set_score(contours, width, height):
     if not contours:
-        return None
+        return -np.inf
 
-    height, width = mask.shape[:2]
-    return max(contours, key=lambda contour: contour_score(contour, width, height))
+    scores = [contour_score(contour, width, height) for contour in contours[:6]]
+    return scores[0] + 0.2 * sum(scores[1:])
 
 
-def contour_from_mask(mask):
+def find_candidate_contours(mask, include_internal=False):
     kernel = np.ones((3, 3), dtype=np.uint8)
     closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    return select_primary_contour(closed)
+
+    height, width = closed.shape[:2]
+    min_perimeter = max(20.0, 0.02 * (width + height))
+
+    raw_contours = []
+    if include_internal:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+        min_area = max(8, int(0.0001 * width * height))
+
+        for label in range(1, num_labels):
+            if stats[label, cv2.CC_STAT_AREA] < min_area:
+                continue
+
+            component_mask = np.where(labels == label, 255, 0).astype(np.uint8)
+            contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if contours:
+                raw_contours.append(max(contours, key=lambda contour: cv2.arcLength(contour, True)))
+    else:
+        raw_contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+    if not raw_contours:
+        return []
+
+    candidates = []
+    for contour in raw_contours:
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter < min_perimeter:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+        if w >= width - 2 and h >= height - 2:
+            continue
+
+        candidates.append(contour)
+
+    candidates.sort(key=lambda contour: contour_score(contour, width, height), reverse=True)
+    return candidates
 
 
-def extract_contour(img):
+def extract_contours(img, include_internal=False):
     if img.ndim == 3 and img.shape[2] == 4:
         alpha = img[:, :, 3]
         if np.any(alpha < 250):
-            contour = contour_from_mask((alpha > 0).astype(np.uint8) * 255)
-            if contour is not None:
-                return contour
+            contours = find_candidate_contours((alpha > 0).astype(np.uint8) * 255, include_internal)
+            if contours:
+                return contours
 
     if img.ndim == 2:
         gray = img
@@ -71,29 +106,143 @@ def extract_contour(img):
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    best_contour = None
+    best_contours = []
     best_score = -np.inf
     height, width = gray.shape[:2]
 
     for mask in (255 - otsu, otsu):
-        contour = contour_from_mask(mask)
-        if contour is None:
+        contours = find_candidate_contours(mask, include_internal)
+        if not contours:
             continue
 
-        score = contour_score(contour, width, height)
+        score = contour_set_score(contours, width, height)
         if score > best_score:
-            best_contour = contour
+            best_contours = contours
             best_score = score
 
-    if best_contour is not None:
-        return best_contour
+    if best_contours:
+        return best_contours
 
     edges = cv2.Canny(blurred, 50, 150)
-    contour = contour_from_mask(edges)
-    if contour is not None:
-        return contour
+    contours = find_candidate_contours(edges, include_internal)
+    if contours:
+        return contours
 
     raise RuntimeError("no contours found in image, try a simpler high-contrast image")
+
+
+def contour_to_points(contour):
+    pts = contour[:, 0, :].astype(float)
+    if len(pts) < 2:
+        return None
+
+    keep = np.ones(len(pts), dtype=bool)
+    keep[1:] = np.any(np.diff(pts, axis=0) != 0, axis=1)
+    pts = pts[keep]
+    if len(pts) < 2:
+        return None
+
+    return pts
+
+
+def nearest_point_index(points, anchor):
+    deltas = points - anchor
+    return int(np.argmin(np.einsum("ij,ij->i", deltas, deltas)))
+
+
+def nearest_pair_indices(points_a, points_b):
+    deltas = points_a[:, None, :] - points_b[None, :, :]
+    dist2 = np.einsum("ijk,ijk->ij", deltas, deltas)
+    index = int(np.argmin(dist2))
+    i, j = divmod(index, dist2.shape[1])
+    return i, j
+
+
+def rotate_loop(points, start_idx):
+    return np.roll(points, -start_idx, axis=0)
+
+
+def orient_loop(points, anchor, start_idx):
+    rotated = rotate_loop(points, start_idx)
+    if len(rotated) <= 2:
+        return rotated
+
+    reversed_rotated = np.concatenate((rotated[:1], rotated[:0:-1]), axis=0)
+    if np.linalg.norm(reversed_rotated[1] - anchor) < np.linalg.norm(rotated[1] - anchor):
+        return reversed_rotated
+
+    return rotated
+
+
+def stitch_contours(contours):
+    loops = [contour_to_points(contour) for contour in contours]
+    loops = [loop for loop in loops if loop is not None]
+    if not loops:
+        raise RuntimeError("no contours found in image, try a simpler high-contrast image")
+
+    current = loops.pop(0)
+    if loops:
+        next_choice = min(
+            (
+                (nearest_pair_indices(current, loop), idx)
+                for idx, loop in enumerate(loops)
+            ),
+            key=lambda item: np.linalg.norm(current[item[0][0]] - loops[item[1]][item[0][1]]),
+        )
+        start_idx, _ = next_choice[0]
+        current = rotate_loop(current, start_idx)
+
+    stitched = [current]
+    current_anchor = current[0]
+
+    while loops:
+        best_idx = None
+        best_start_idx = None
+        best_distance = np.inf
+
+        for idx, loop in enumerate(loops):
+            start_idx = nearest_point_index(loop, current_anchor)
+            distance = np.linalg.norm(loop[start_idx] - current_anchor)
+            if distance < best_distance:
+                best_idx = idx
+                best_start_idx = start_idx
+                best_distance = distance
+
+        next_loop = loops.pop(best_idx)
+        next_loop = orient_loop(next_loop, current_anchor, best_start_idx)
+        stitched.append(next_loop)
+        current_anchor = next_loop[0]
+
+    path = np.vstack([stitched[0], stitched[0][0]])
+    for loop in stitched[1:]:
+        path = np.vstack([path, loop, loop[0]])
+
+    return path
+
+
+def sample_path(points, n, closed=True):
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 2:
+        raise RuntimeError("detected contour has too few points")
+
+    if closed:
+        pts = np.vstack([pts, pts[0]])
+
+    diffs = np.diff(pts, axis=0)
+    segment_lengths = np.hypot(diffs[:, 0], diffs[:, 1])
+    keep = np.concatenate(([True], segment_lengths > 0))
+    pts = pts[keep]
+
+    diffs = np.diff(pts, axis=0)
+    arc = np.concatenate([[0], np.cumsum(np.hypot(diffs[:, 0], diffs[:, 1]))])
+    total = arc[-1]
+    if total == 0:
+        raise RuntimeError("detected contour has zero length")
+
+    t_new = np.linspace(0, total, n, endpoint=False)
+    x = np.interp(t_new, arc, pts[:, 0])
+    y = np.interp(t_new, arc, pts[:, 1])
+    return x, y
 
 
 # built-in example shapes defined as parametric curves sampled at n points
@@ -121,25 +270,18 @@ def make_example_shape(name, n=1000):
 
 
 # extract a contour from an image file and return it as (x, y) arrays
-def contour_from_image(path, n=1000):
+def contour_from_image(path, n=1000, stitch=False):
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(f"could not open image: {path}")
 
-    contour = extract_contour(img)
-    pts = contour[:, 0, :].astype(float)
-
-    # parameterize by closed-curve arc length then resample to n points
-    pts = np.vstack([pts, pts[0]])
-    diffs = np.diff(pts, axis=0)
-    arc = np.concatenate([[0], np.cumsum(np.hypot(diffs[:, 0], diffs[:, 1]))])
-    total = arc[-1]
-    if total == 0:
-        raise RuntimeError("detected contour has zero length")
-
-    t_new = np.linspace(0, total, n, endpoint=False)
-    x = np.interp(t_new, arc, pts[:, 0])
-    y = np.interp(t_new, arc, pts[:, 1])
+    contours = extract_contours(img, include_internal=stitch)
+    if stitch:
+        pts = stitch_contours(contours)
+        x, y = sample_path(pts, n, closed=True)
+    else:
+        pts = contour_to_points(contours[0])
+        x, y = sample_path(pts, n, closed=True)
 
     # center and normalize so the shape fits nicely
     x, y = normalize_curve(x, y)
@@ -361,6 +503,8 @@ def main():
         help="number of epicycle terms to use (default 50)")
     parser.add_argument("--points", type=int, default=1000,
         help="number of contour sample points (default 1000)")
+    parser.add_argument("--stitch-contours", action="store_true",
+        help="for image input, stitch multiple detected contours into one continuous path to preserve interior details")
     parser.add_argument("--arms", action="store_true",
         help="show spinning epicycle arms and circles")
     parser.add_argument("--output", default="show",
@@ -376,7 +520,7 @@ def main():
 
     print("loading shape...")
     if args.image:
-        x, y = contour_from_image(args.image, n=args.points)
+        x, y = contour_from_image(args.image, n=args.points, stitch=args.stitch_contours)
     else:
         x, y = make_example_shape(args.example, n=args.points)
 
