@@ -48,31 +48,11 @@ def contour_set_score(contours, width, height):
     return scores[0] + 0.2 * sum(scores[1:])
 
 
-def find_candidate_contours(mask, include_internal=False):
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    height, width = closed.shape[:2]
-    min_perimeter = max(20.0, 0.02 * (width + height))
-
-    raw_contours = []
-    if include_internal:
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
-        min_area = max(8, int(0.0001 * width * height))
-
-        for label in range(1, num_labels):
-            if stats[label, cv2.CC_STAT_AREA] < min_area:
-                continue
-
-            component_mask = np.where(labels == label, 255, 0).astype(np.uint8)
-            contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            if contours:
-                raw_contours.append(max(contours, key=lambda contour: cv2.arcLength(contour, True)))
-    else:
-        raw_contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-
+def filter_candidate_contours(raw_contours, width, height):
     if not raw_contours:
         return []
+
+    min_perimeter = max(20.0, 0.02 * (width + height))
 
     candidates = []
     for contour in raw_contours:
@@ -90,12 +70,47 @@ def find_candidate_contours(mask, include_internal=False):
     return candidates
 
 
+def find_candidate_contours(mask, include_internal=False, prefer_tree=False):
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    height, width = closed.shape[:2]
+
+    raw_contours = []
+    if prefer_tree:
+        raw_contours, _ = cv2.findContours(closed, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    elif include_internal:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+        min_area = max(8, int(0.0001 * width * height))
+
+        for label in range(1, num_labels):
+            if stats[label, cv2.CC_STAT_AREA] < min_area:
+                continue
+
+            component_mask = np.where(labels == label, 255, 0).astype(np.uint8)
+            contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if contours:
+                raw_contours.append(max(contours, key=lambda contour: cv2.arcLength(contour, True)))
+    else:
+        raw_contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+    if not raw_contours:
+        return []
+
+    return filter_candidate_contours(raw_contours, width, height)
+
+
 def extract_contours(img, include_internal=False):
     if img.ndim == 3 and img.shape[2] == 4:
         alpha = img[:, :, 3]
         if np.any(alpha < 250):
-            contours = find_candidate_contours((alpha > 0).astype(np.uint8) * 255, include_internal)
+            mask = (alpha > 0).astype(np.uint8) * 255
+            contours = find_candidate_contours(mask, include_internal)
             if contours:
+                if include_internal and len(contours) <= 1:
+                    tree_contours = find_candidate_contours(mask, include_internal=True, prefer_tree=True)
+                    if len(tree_contours) > len(contours):
+                        return tree_contours
                 return contours
 
     if img.ndim == 2:
@@ -115,6 +130,11 @@ def extract_contours(img, include_internal=False):
         if not contours:
             continue
 
+        if include_internal and len(contours) <= 1:
+            tree_contours = find_candidate_contours(mask, include_internal=True, prefer_tree=True)
+            if len(tree_contours) > len(contours):
+                contours = tree_contours
+
         score = contour_set_score(contours, width, height)
         if score > best_score:
             best_contours = contours
@@ -125,6 +145,10 @@ def extract_contours(img, include_internal=False):
 
     edges = cv2.Canny(blurred, 50, 150)
     contours = find_candidate_contours(edges, include_internal)
+    if include_internal and len(contours) <= 1:
+        tree_contours = find_candidate_contours(edges, include_internal=True, prefer_tree=True)
+        if len(tree_contours) > len(contours):
+            contours = tree_contours
     if contours:
         return contours
 
