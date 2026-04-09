@@ -25,6 +25,77 @@ def normalize_curve(x, y):
     return x, y
 
 
+def contour_score(contour, width, height):
+    x, y, w, h = cv2.boundingRect(contour)
+    touches_border = x <= 1 or y <= 1 or x + w >= width - 1 or y + h >= height - 1
+
+    score = cv2.arcLength(contour, True)
+    if touches_border:
+        score *= 0.5
+
+    # De-prioritize full-frame regions, which are usually the background.
+    if w >= width - 2 and h >= height - 2:
+        score *= 0.25
+
+    return score
+
+
+def select_primary_contour(mask):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+
+    height, width = mask.shape[:2]
+    return max(contours, key=lambda contour: contour_score(contour, width, height))
+
+
+def contour_from_mask(mask):
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return select_primary_contour(closed)
+
+
+def extract_contour(img):
+    if img.ndim == 3 and img.shape[2] == 4:
+        alpha = img[:, :, 3]
+        if np.any(alpha < 250):
+            contour = contour_from_mask((alpha > 0).astype(np.uint8) * 255)
+            if contour is not None:
+                return contour
+
+    if img.ndim == 2:
+        gray = img
+    else:
+        gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    best_contour = None
+    best_score = -np.inf
+    height, width = gray.shape[:2]
+
+    for mask in (255 - otsu, otsu):
+        contour = contour_from_mask(mask)
+        if contour is None:
+            continue
+
+        score = contour_score(contour, width, height)
+        if score > best_score:
+            best_contour = contour
+            best_score = score
+
+    if best_contour is not None:
+        return best_contour
+
+    edges = cv2.Canny(blurred, 50, 150)
+    contour = contour_from_mask(edges)
+    if contour is not None:
+        return contour
+
+    raise RuntimeError("no contours found in image, try a simpler high-contrast image")
+
+
 # built-in example shapes defined as parametric curves sampled at n points
 def make_example_shape(name, n=1000):
     t = np.linspace(0, 2 * np.pi, n, endpoint=False)
@@ -51,28 +122,21 @@ def make_example_shape(name, n=1000):
 
 # extract a contour from an image file and return it as (x, y) arrays
 def contour_from_image(path, n=1000):
-    img = cv2.imread(path)
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(f"could not open image: {path}")
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    contour = extract_contour(img)
+    pts = contour[:, 0, :].astype(float)
 
-    # blur slightly, then canny edge detection
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not contours:
-        raise RuntimeError("no contours found in image, try a simpler high-contrast image")
-
-    # pick the longest contour and resample it uniformly
-    longest = max(contours, key=lambda c: len(c))
-    pts = longest[:, 0, :]  # shape (m, 2)
-
-    # parameterize by arc length then resample to n points
+    # parameterize by closed-curve arc length then resample to n points
+    pts = np.vstack([pts, pts[0]])
     diffs = np.diff(pts, axis=0)
     arc = np.concatenate([[0], np.cumsum(np.hypot(diffs[:, 0], diffs[:, 1]))])
     total = arc[-1]
+    if total == 0:
+        raise RuntimeError("detected contour has zero length")
+
     t_new = np.linspace(0, total, n, endpoint=False)
     x = np.interp(t_new, arc, pts[:, 0])
     y = np.interp(t_new, arc, pts[:, 1])
