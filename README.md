@@ -57,6 +57,12 @@ Stitch multiple image contours into one path to capture internal details:
 python3 epicycles.py --image path/to/logo.png --stitch-contours --arms
 ```
 
+Use hybrid detail extraction to pull in smaller interior features like lettering:
+
+```bash
+python3 epicycles.py --image path/to/logo.png --detail-contours --terms 250 --arms
+```
+
 Save a GIF:
 
 ```bash
@@ -101,9 +107,10 @@ Load an image and extract a contour from it. The script:
 1. reads the image with OpenCV
 2. extracts a binary mask from transparency or image intensity
 3. finds the main outer contour by default
-4. optionally collects multiple disconnected internal components with `--stitch-contours`
-5. resamples the resulting path to the requested number of points
-6. centers and normalizes it before animation
+4. optionally stitches multiple disconnected components with `--stitch-contours`
+5. optionally combines dark, light, adaptive, and edge masks with `--detail-contours` to recover smaller internal features
+6. resamples the resulting path to the requested number of points
+7. centers and normalizes it before animation
 
 For best results, use a simple high-contrast image with clear dark linework or a transparent background.
 
@@ -122,6 +129,8 @@ python3 epicycles.py --image assets/shape.png
 | `--terms N` | integer | `50` | Number of Fourier terms / epicycles used for reconstruction. Larger values usually improve detail but add visual complexity. |
 | `--points N` | integer | `1000` | Number of sample points used to represent the source curve before taking the DFT. Higher values preserve more detail but increase computation time. |
 | `--stitch-contours` | flag | off | For image input, stitch multiple detected contour components into one continuous path so internal details are included. This adds bridge segments between components. |
+| `--detail-contours` | flag | off | For image input, combine multiple mask types to recover smaller internal details. Implies `--stitch-contours`. |
+| `--max-contours N` | integer | none | Optional cap on the number of stitched image contours kept after ranking. Useful if detail mode starts pulling in noise. |
 | `--arms` | flag | off | Draw the spinning arm segments and circles. If omitted, only the traced path and faint target outline are shown. |
 | `--output VALUE` | string | `show` | Output mode. Use `show` for an interactive window, a filename ending in `.gif` for GIF export, or any other filename for MP4 export. |
 | `--fps N` | integer | `30` | Frames per second for the animation. Applies to both display timing and saved output. |
@@ -192,6 +201,12 @@ Capture inner details by stitching multiple image components into one path:
 
 ```bash
 python3 epicycles.py --image path/to/input.png --stitch-contours --points 2000
+```
+
+Use hybrid detail extraction, and cap contour count only if the result gets noisy:
+
+```bash
+python3 epicycles.py --image path/to/input.png --detail-contours --points 4000 --terms 250
 ```
 
 Show the epicycle arms and save a GIF:

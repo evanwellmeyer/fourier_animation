@@ -48,11 +48,11 @@ def contour_set_score(contours, width, height):
     return scores[0] + 0.2 * sum(scores[1:])
 
 
-def filter_candidate_contours(raw_contours, width, height):
+def filter_candidate_contours(raw_contours, width, height, detail_mode=False):
     if not raw_contours:
         return []
 
-    min_perimeter = max(20.0, 0.02 * (width + height))
+    min_perimeter = max(8.0, 0.0075 * (width + height)) if detail_mode else max(20.0, 0.02 * (width + height))
 
     candidates = []
     for contour in raw_contours:
@@ -70,7 +70,7 @@ def filter_candidate_contours(raw_contours, width, height):
     return candidates
 
 
-def find_candidate_contours(mask, include_internal=False, prefer_tree=False):
+def find_candidate_contours(mask, include_internal=False, prefer_tree=False, detail_mode=False):
     kernel = np.ones((3, 3), dtype=np.uint8)
     closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -97,43 +97,165 @@ def find_candidate_contours(mask, include_internal=False, prefer_tree=False):
     if not raw_contours:
         return []
 
-    return filter_candidate_contours(raw_contours, width, height)
+    return filter_candidate_contours(raw_contours, width, height, detail_mode=detail_mode)
 
 
-def extract_contours(img, include_internal=False):
+def extract_mask_contours(mask, include_internal=False, detail_mode=False):
+    contours = find_candidate_contours(mask, include_internal, detail_mode=detail_mode)
+    if include_internal and len(contours) <= 1:
+        tree_contours = find_candidate_contours(mask, include_internal=True, prefer_tree=True, detail_mode=detail_mode)
+        if len(tree_contours) > len(contours):
+            contours = tree_contours
+
+    return contours
+
+
+def build_image_masks(img, gray, detail_mode=False):
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    masks = []
     if img.ndim == 3 and img.shape[2] == 4:
         alpha = img[:, :, 3]
         if np.any(alpha < 250):
-            mask = (alpha > 0).astype(np.uint8) * 255
-            contours = find_candidate_contours(mask, include_internal)
-            if contours:
-                if include_internal and len(contours) <= 1:
-                    tree_contours = find_candidate_contours(mask, include_internal=True, prefer_tree=True)
-                    if len(tree_contours) > len(contours):
-                        return tree_contours
-                return contours
+            masks.append(("alpha", (alpha > 0).astype(np.uint8) * 255))
 
+    masks.append(("dark-otsu", 255 - otsu))
+    masks.append(("light-otsu", otsu))
+
+    if detail_mode:
+        masks.append((
+            "dark-adaptive",
+            cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 5
+            ),
+        ))
+        masks.append((
+            "light-adaptive",
+            cv2.adaptiveThreshold(
+                blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
+            ),
+        ))
+        masks.append(("edges", cv2.Canny(blurred, 30, 100)))
+    else:
+        masks.append(("edges", cv2.Canny(blurred, 50, 150)))
+
+    return masks
+
+
+def contour_box_iou(box_a, box_b):
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+
+    x0 = max(ax, bx)
+    y0 = max(ay, by)
+    x1 = min(ax + aw, bx + bw)
+    y1 = min(ay + ah, by + bh)
+
+    inter_w = max(0, x1 - x0)
+    inter_h = max(0, y1 - y0)
+    intersection = inter_w * inter_h
+    if intersection == 0:
+        return 0.0
+
+    union = aw * ah + bw * bh - intersection
+    return intersection / union if union else 0.0
+
+
+def contours_similar(contour_a, contour_b):
+    box_a = cv2.boundingRect(contour_a)
+    box_b = cv2.boundingRect(contour_b)
+
+    ax, ay, aw, ah = box_a
+    bx, by, bw, bh = box_b
+    center_a = np.array([ax + aw / 2, ay + ah / 2], dtype=float)
+    center_b = np.array([bx + bw / 2, by + bh / 2], dtype=float)
+    max_diag = max(np.hypot(aw, ah), np.hypot(bw, bh))
+
+    if np.linalg.norm(center_a - center_b) > 0.18 * max_diag + 2:
+        return False
+
+    per_a = cv2.arcLength(contour_a, True)
+    per_b = cv2.arcLength(contour_b, True)
+    if min(per_a, per_b) == 0:
+        return False
+
+    per_ratio = max(per_a, per_b) / min(per_a, per_b)
+    if per_ratio > 1.8:
+        return False
+
+    area_a = max(abs(cv2.contourArea(contour_a)), aw * ah)
+    area_b = max(abs(cv2.contourArea(contour_b)), bw * bh)
+    area_ratio = max(area_a, area_b) / max(min(area_a, area_b), 1.0)
+    if area_ratio > 2.5:
+        return False
+
+    return contour_box_iou(box_a, box_b) > 0.45
+
+
+def merge_contour_sets(contour_sets, width, height, max_contours=None):
+    ranked = []
+    source_weights = {
+        "alpha": 1.0,
+        "dark-otsu": 1.0,
+        "light-otsu": 0.95,
+        "dark-adaptive": 0.9,
+        "light-adaptive": 0.85,
+        "edges": 0.75,
+    }
+
+    for source_name, contours in contour_sets:
+        weight = source_weights.get(source_name, 1.0)
+        for contour in contours:
+            ranked.append((weight * contour_score(contour, width, height), contour))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    merged = []
+    for _, contour in ranked:
+        if any(contours_similar(contour, existing) for existing in merged):
+            continue
+
+        merged.append(contour)
+        if max_contours is not None and len(merged) >= max_contours:
+            break
+
+    return merged
+
+
+def limit_contours(contours, max_contours=None):
+    if max_contours is None:
+        return contours
+
+    return contours[:max_contours]
+
+
+def extract_contours(img, include_internal=False, detail_mode=False, max_contours=None):
     if img.ndim == 2:
         gray = img
     else:
         gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
 
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
+    masks = build_image_masks(img, gray, detail_mode=detail_mode)
     best_contours = []
     best_score = -np.inf
     height, width = gray.shape[:2]
 
-    for mask in (255 - otsu, otsu):
-        contours = find_candidate_contours(mask, include_internal)
+    if detail_mode and include_internal:
+        contour_sets = []
+        for source_name, mask in masks:
+            contours = extract_mask_contours(mask, include_internal=True, detail_mode=True)
+            if contours:
+                contour_sets.append((source_name, contours))
+
+        merged = merge_contour_sets(contour_sets, width, height, max_contours=max_contours)
+        if merged:
+            return merged
+
+    for _, mask in masks:
+        contours = extract_mask_contours(mask, include_internal=include_internal, detail_mode=detail_mode)
         if not contours:
             continue
-
-        if include_internal and len(contours) <= 1:
-            tree_contours = find_candidate_contours(mask, include_internal=True, prefer_tree=True)
-            if len(tree_contours) > len(contours):
-                contours = tree_contours
 
         score = contour_set_score(contours, width, height)
         if score > best_score:
@@ -141,16 +263,7 @@ def extract_contours(img, include_internal=False):
             best_score = score
 
     if best_contours:
-        return best_contours
-
-    edges = cv2.Canny(blurred, 50, 150)
-    contours = find_candidate_contours(edges, include_internal)
-    if include_internal and len(contours) <= 1:
-        tree_contours = find_candidate_contours(edges, include_internal=True, prefer_tree=True)
-        if len(tree_contours) > len(contours):
-            contours = tree_contours
-    if contours:
-        return contours
+        return limit_contours(best_contours, max_contours=max_contours)
 
     raise RuntimeError("no contours found in image, try a simpler high-contrast image")
 
@@ -294,12 +407,17 @@ def make_example_shape(name, n=1000):
 
 
 # extract a contour from an image file and return it as (x, y) arrays
-def contour_from_image(path, n=1000, stitch=False):
+def contour_from_image(path, n=1000, stitch=False, detail_mode=False, max_contours=None):
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
         raise FileNotFoundError(f"could not open image: {path}")
 
-    contours = extract_contours(img, include_internal=stitch)
+    contours = extract_contours(
+        img,
+        include_internal=stitch,
+        detail_mode=detail_mode,
+        max_contours=max_contours,
+    )
     if stitch:
         pts = stitch_contours(contours)
         x, y = sample_path(pts, n, closed=True)
@@ -529,6 +647,10 @@ def main():
         help="number of contour sample points (default 1000)")
     parser.add_argument("--stitch-contours", action="store_true",
         help="for image input, stitch multiple detected contours into one continuous path to preserve interior details")
+    parser.add_argument("--detail-contours", action="store_true",
+        help="for image input, combine dark, light, adaptive, and edge masks to recover smaller internal details; implies --stitch-contours")
+    parser.add_argument("--max-contours", type=int,
+        help="optional cap on how many stitched image contours to keep after ranking; useful if detail mode gets noisy")
     parser.add_argument("--arms", action="store_true",
         help="show spinning epicycle arms and circles")
     parser.add_argument("--output", default="show",
@@ -544,7 +666,14 @@ def main():
 
     print("loading shape...")
     if args.image:
-        x, y = contour_from_image(args.image, n=args.points, stitch=args.stitch_contours)
+        stitch_mode = args.stitch_contours or args.detail_contours
+        x, y = contour_from_image(
+            args.image,
+            n=args.points,
+            stitch=stitch_mode,
+            detail_mode=args.detail_contours,
+            max_contours=args.max_contours,
+        )
     else:
         x, y = make_example_shape(args.example, n=args.points)
 
