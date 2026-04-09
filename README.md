@@ -121,6 +121,7 @@ python3 epicycles.py --image assets/shape.png
 | `--output VALUE` | string | `show` | Output mode. Use `show` for an interactive window, a filename ending in `.gif` for GIF export, or any other filename for MP4 export. |
 | `--fps N` | integer | `30` | Frames per second for the animation. Applies to both display timing and saved output. |
 | `--duration N` | integer | `8` | Total animation length in seconds. Total frames = `fps * duration`. |
+| `--build-duration N` | float | `3.0` | Seconds spent progressively adding Fourier terms before the final full-term trace begins. Use `0` to disable the buildup phase. |
 
 ## Output Behavior
 
@@ -192,6 +193,12 @@ Create a longer, higher-frame-rate MP4:
 
 ```bash
 python3 epicycles.py --example trefoil --fps 60 --duration 12 --output trefoil.mp4
+```
+
+Spend more time on the term-by-term buildup before tracing:
+
+```bash
+python3 epicycles.py --example heart --terms 80 --arms --build-duration 5
 ```
 
 ## How the Main Settings Affect the Result
